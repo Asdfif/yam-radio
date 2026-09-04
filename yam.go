@@ -108,7 +108,7 @@ type tokenData struct {
 
 func tokenPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "ym-radio", "token.json")
+	return filepath.Join(home, ".config", "yam-radio", "token.json")
 }
 
 func loadToken() *tokenData {
@@ -596,7 +596,7 @@ func (ts *termState) restore() {
 
 func playOne(stream string, tr *track, c *client, sf *stopFlag, keyCh <-chan byte) (string, float64) {
 	t0 := time.Now()
-	dir, err := os.MkdirTemp("", "mywave-")
+	dir, err := os.MkdirTemp("", "yam-")
 	if err != nil {
 		return "skipped", 0
 	}
@@ -734,7 +734,7 @@ func run() error {
 	w := newWave(c, station)
 	cur, err := w.start()
 	if err != nil {
-		return fmt.Errorf("не удалось запустить станцию %q: %w (список станций: mywave --list-stations)", station, err)
+		return fmt.Errorf("не удалось запустить станцию %q: %w (список станций: yam --list-stations)", station, err)
 	}
 
 	sf := &stopFlag{ch: make(chan struct{})}
