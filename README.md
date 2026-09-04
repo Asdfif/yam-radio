@@ -70,6 +70,7 @@ go build -o yam .
 | `YAM_OAUTH_CLIENT_ID` | OAuth client_id (device flow) |
 | `YAM_OAUTH_CLIENT_SECRET` | OAuth client_secret |
 | `YAM_SIGN_SALT` | Соль для подписи прямых ссылок на MP3 |
+| `YAM_DEDUP_WINDOW` | Сколько последних треков сессии не повторять (по умолчанию 100) |
 
 ## Как это работает
 

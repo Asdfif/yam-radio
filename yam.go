@@ -477,17 +477,38 @@ func (c *client) likeTrack(trackID string) error {
 	return err
 }
 
+// Окно дедупа: сколько последних прозвучавших треков помним, чтобы
+// не ставить их повторно. YAM_DEDUP_WINDOW, дефолт 100, мин. 1.
+func dedupWindow() int {
+	if v, err := strconv.Atoi(os.Getenv("YAM_DEDUP_WINDOW")); err == nil && v > 0 {
+		return v
+	}
+	return 100
+}
+
+// Сколько раз подряд можно запрашивать новую пачку, если вся пачка состоит
+// из уже прозвучавших треков, прежде чем играть первый доступный.
+const maxBatchRefetches = 3
+
 type wave struct {
-	c       *client
-	station string
-	from    string
-	batch   *batch
-	index   int
-	cur     *track
+	c         *client
+	station   string
+	from      string
+	batch     *batch
+	index     int
+	cur       *track
+	window    int
+	recentSeq []string
+	recentSet map[string]bool
 }
 
 func newWave(c *client, station string) *wave {
-	w := &wave{c: c, station: station}
+	w := &wave{
+		c:         c,
+		station:   station,
+		window:    dedupWindow(),
+		recentSet: map[string]bool{},
+	}
 	w.from = w.resolveFrom()
 	return w
 }
@@ -508,17 +529,37 @@ func (w *wave) resolveFrom() string {
 	return strings.SplitN(w.station, ":", 2)[0]
 }
 
-func (w *wave) start() (*track, error) {
-	b, err := w.c.stationTracks(w.station, "")
+func (w *wave) markRecent(id string) {
+	if w.recentSet[id] {
+		return
+	}
+	w.recentSet[id] = true
+	w.recentSeq = append(w.recentSeq, id)
+	if len(w.recentSeq) > w.window {
+		old := w.recentSeq[0]
+		w.recentSeq = w.recentSeq[1:]
+		delete(w.recentSet, old)
+	}
+}
+
+func (w *wave) refetchBatch(seed string) error {
+	b, err := w.c.stationTracks(w.station, seed)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if len(b.Sequence) == 0 {
-		return nil, fmt.Errorf("пустая последовательность для станции %q", w.station)
+		return fmt.Errorf("пустая последовательность для станции %q", w.station)
 	}
 	w.batch = b
 	w.c.feedback(w.station, "radioStarted", w.batch.BatchID, "", w.from, 0)
 	w.index = 0
+	return nil
+}
+
+func (w *wave) start() (*track, error) {
+	if err := w.refetchBatch(""); err != nil {
+		return nil, err
+	}
 	return w.take()
 }
 
@@ -530,29 +571,58 @@ func (w *wave) next(playedFull bool, played float64) (*track, error) {
 			w.c.feedback(w.station, "skip", w.batch.BatchID, w.cur.trackID(), "", played)
 		}
 	}
-	if w.index+1 >= len(w.batch.Sequence) {
-		prev := w.cur.trackID()
-		b, err := w.c.stationTracks(w.station, prev)
-		if err != nil {
-			return nil, err
-		}
-		w.batch = b
-		w.c.feedback(w.station, "radioStarted", w.batch.BatchID, "", w.from, 0)
-		w.index = 0
-	} else {
-		w.index++
-	}
 	return w.take()
 }
 
+// take двигает курсор вперёд по пачке, тихо пропуская пустые элементы и
+// треки, уже прозвучавшие в пределах окна дедупа, и добирает новую пачку,
+// когда текущая кончается. Возвращает первый доступный трек.
 func (w *wave) take() (*track, error) {
-	seq := w.batch.Sequence[w.index]
-	if seq.Track == nil {
-		return nil, fmt.Errorf("элемент без трека (реклама?)")
+	refetches := 0
+	for {
+		if w.index >= len(w.batch.Sequence) {
+			if refetches >= maxBatchRefetches {
+				return w.takeAnyway()
+			}
+			seed := ""
+			if w.cur != nil {
+				seed = w.cur.trackID()
+			}
+			if err := w.refetchBatch(seed); err != nil {
+				return nil, err
+			}
+			refetches++
+			continue
+		}
+		seq := w.batch.Sequence[w.index]
+		w.index++
+		if seq.Track == nil {
+			continue
+		}
+		if w.recentSet[seq.Track.trackID()] {
+			continue
+		}
+		w.cur = seq.Track
+		w.markRecent(w.cur.trackID())
+		w.c.feedback(w.station, "trackStarted", w.batch.BatchID, w.cur.trackID(), "", 0)
+		return w.cur, nil
 	}
-	w.cur = seq.Track
-	w.c.feedback(w.station, "trackStarted", w.batch.BatchID, w.cur.trackID(), "", 0)
-	return w.cur, nil
+}
+
+// takeAnyway играет первый реальный трек текущей пачки, даже если он уже
+// прозвучал: радио не должно останавливаться из-за повтора.
+func (w *wave) takeAnyway() (*track, error) {
+	for i := range w.batch.Sequence {
+		if w.batch.Sequence[i].Track != nil {
+			w.index = i + 1
+			w.cur = w.batch.Sequence[i].Track
+			w.markRecent(w.cur.trackID())
+			fmt.Printf("  [warn] доступные треки уже прозвучали, играю: %s\n", w.cur.Title)
+			w.c.feedback(w.station, "trackStarted", w.batch.BatchID, w.cur.trackID(), "", 0)
+			return w.cur, nil
+		}
+	}
+	return nil, fmt.Errorf("нет доступных треков в пачке")
 }
 
 func mpvCmd(sock string, cmd []any) {
