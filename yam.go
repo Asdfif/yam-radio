@@ -27,16 +27,30 @@ import (
 const (
 	apiBase        = "https://api.music.yandex.net"
 	oauthBase      = "https://oauth.yandex.ru"
-	oauthClientID  = "23cabbbdc6cd418abb4b39c32c41195d"
-	oauthClientSec = "53bc75238f0c4d08a118e51fe9203300"
 	defaultStation = "user:onyourwave"
-	signSalt       = "XGRlBW9FXlekgbPrRHuSiA"
 
 	helpText = "Управление:\n" +
 		"  1 — пауза / продолжить\n" +
 		"  2 — следующий трек\n" +
 		"  3 — добавить трек в избранное\n" +
 		"  q / Ctrl+C — выход"
+)
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// Публичные значения официального Android-приложения Яндекс.Музыки:
+// OAuth-креды (те же, что в open-source библиотеке yandex-music) и соль
+// подписи прямых ссылок на MP3. Это не личные секреты, но при желании
+// можно переопределить переменными окружения.
+var (
+	oauthClientID  = envOrDefault("YAM_OAUTH_CLIENT_ID", "23cabbbdc6cd418abb4b39c32c41195d")
+	oauthClientSec = envOrDefault("YAM_OAUTH_CLIENT_SECRET", "53bc75238f0c4d08a118e51fe9203300")
+	signSalt       = envOrDefault("YAM_SIGN_SALT", "XGRlBW9FXlekgbPrRHuSiA")
 )
 
 type flexID string
