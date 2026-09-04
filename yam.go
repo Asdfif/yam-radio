@@ -637,6 +637,150 @@ func mpvCmd(sock string, cmd []any) {
 	_, _ = conn.Write(payload)
 }
 
+// mpvGetProps запрашивает числовые свойства mpv одним коротким IPC-соединением.
+// События без request_id (end-file и т.п.) пропускаются; null-значения
+// (длина ещё не определена) не попадают в результат.
+func mpvGetProps(sock string, props []string) (map[string]float64, error) {
+	conn, err := net.DialTimeout("unix", sock, 500*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	byID := make(map[int]string, len(props))
+	enc := json.NewEncoder(conn)
+	for i, p := range props {
+		byID[i+1] = p
+		if err := enc.Encode(map[string]any{"command": []any{"get_property", p}, "request_id": i + 1}); err != nil {
+			return nil, err
+		}
+	}
+	out := make(map[string]float64, len(props))
+	dec := json.NewDecoder(conn)
+	for got := 0; got < len(props); {
+		var msg struct {
+			RequestID int             `json:"request_id"`
+			Error     string          `json:"error"`
+			Data      json.RawMessage `json:"data"`
+		}
+		if err := dec.Decode(&msg); err != nil {
+			return out, err
+		}
+		prop, known := byID[msg.RequestID]
+		if !known {
+			continue
+		}
+		got++
+		if msg.Error != "success" {
+			continue
+		}
+		var v *float64
+		if json.Unmarshal(msg.Data, &v) == nil && v != nil {
+			out[prop] = *v
+		}
+	}
+	return out, nil
+}
+
+func fmtClock(sec float64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	s := int(sec)
+	h, m := s/3600, (s%3600)/60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s%60)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s%60)
+}
+
+const progressWidth = 24
+
+// progressUI обновляет строку «прошло / всего» под заголовком трека.
+// Вывод тикера и сообщений плеера сериализован одним мьютексом, чтобы
+// строки не размазывались; при перенаправлении stdout индикатор выключен.
+type progressUI struct {
+	mu     sync.Mutex
+	sock   string
+	total  float64
+	live   bool
+	stopCh chan struct{}
+	done   chan struct{}
+}
+
+func newProgressUI(sock string, total float64) *progressUI {
+	p := &progressUI{sock: sock, total: total, stopCh: make(chan struct{}), done: make(chan struct{})}
+	if fi, err := os.Stdout.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		p.live = true
+	}
+	return p
+}
+
+func (p *progressUI) start() {
+	if p.live {
+		go p.run()
+		return
+	}
+	close(p.done)
+}
+
+// stop гасит строку индикатора и дожидается выхода горутины, чтобы заголовок
+// следующего трека не затёрт поздним тиком.
+func (p *progressUI) stop() {
+	close(p.stopCh)
+	<-p.done
+}
+
+func (p *progressUI) run() {
+	defer close(p.done)
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			p.clear()
+			return
+		case <-tick.C:
+			props, err := mpvGetProps(p.sock, []string{"time-pos", "length"})
+			if err != nil {
+				continue
+			}
+			pos, ok := props["time-pos"]
+			if !ok {
+				continue
+			}
+			total := p.total
+			if l, ok := props["length"]; ok && l > 0 {
+				total = l
+			}
+			p.render(pos, total)
+		}
+	}
+}
+
+func (p *progressUI) render(pos, total float64) {
+	if !p.live {
+		return
+	}
+	line := fmt.Sprintf("  %s / %s", fmtClock(pos), fmtClock(total))
+	pad := progressWidth - len(line)
+	if pad < 0 {
+		pad = 0
+	}
+	p.mu.Lock()
+	fmt.Fprint(os.Stdout, "\r"+line+strings.Repeat(" ", pad))
+	p.mu.Unlock()
+}
+
+func (p *progressUI) clear() {
+	if !p.live {
+		return
+	}
+	p.mu.Lock()
+	fmt.Fprint(os.Stdout, "\r"+strings.Repeat(" ", progressWidth)+"\r")
+	p.mu.Unlock()
+}
+
 type stopFlag struct {
 	once sync.Once
 	ch   chan struct{}
@@ -707,6 +851,14 @@ func playOne(stream string, tr *track, c *client, sf *stopFlag, keyCh <-chan byt
 		}
 	}
 
+	pg := newProgressUI(sock, float64(tr.DurationMs)/1000.0)
+	pg.start()
+	defer pg.stop()
+	note := func(format string, args ...any) {
+		pg.clear()
+		fmt.Printf(format+"\n", args...)
+	}
+
 	skipped := false
 	paused := false
 	liked := false
@@ -725,9 +877,9 @@ func playOne(stream string, tr *track, c *client, sf *stopFlag, keyCh <-chan byt
 				paused = !paused
 				mpvCmd(sock, []any{"set_property", "pause", paused})
 				if paused {
-					fmt.Println("[пауза]")
+					note("[пауза]")
 				} else {
-					fmt.Println("[продолжить]")
+					note("[продолжить]")
 				}
 			case '2':
 				skipped = true
@@ -736,9 +888,9 @@ func playOne(stream string, tr *track, c *client, sf *stopFlag, keyCh <-chan byt
 				if !liked {
 					liked = true
 					if err := c.likeTrack(tr.trackID()); err != nil {
-						fmt.Printf("[избранное] ошибка: %v\n", err)
+						note("[избранное] ошибка: %v", err)
 					} else {
-						fmt.Printf("[избранное] %s\n", tr.Title)
+						note("[избранное] %s", tr.Title)
 					}
 				}
 			case 'q', 0x03:
